@@ -1,3 +1,4 @@
 pypdf>=3.0
 pdfminer.six>=20201018
 tqdm
+pandas

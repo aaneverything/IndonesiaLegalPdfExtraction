@@ -1,11 +1,29 @@
-import json, re, unicodedata
+#!/usr/bin/env python3
+"""
+PDF -> final_corpus.jsonl (full pipeline)
+- Extract text (pypdf, fallback pdfminer)
+- Detect structure (BUKU/BAB/BAGIAN/Pasal)
+- Minimal cleaning (preserve separators and (1),(2) markers)
+- Build per-Pasal records
+- Explode Pasal -> Ayat rows (regex)
+- Drop "Penjelasan" blocks (title contains "penjelasan" or text startswith "cukup jelas")
+- Write final JSONL corpus
+
+Dependencies:
+  pip install pypdf pdfminer.six pandas
+"""
+import json
+import re
+import unicodedata
 from pathlib import Path
 from typing import List, Dict, Optional
+import pandas as pd
 
-# ---------- Configure your PDFs ----------
+# ---------------- CONFIG: sesuaikan path PDF dan nama output ----------------
 PDF_FILES = [
     {"pdf": "pdf/UU Nomor 1 Tahun 2023.pdf", "uu_code": "UU_CIPTA_KERJA_2023", "uu_name": "Undang-Undang Cipta Kerja", "uu_number": "UU No. 1 Tahun 2023", "year": 2023, "valid_from": None, "valid_to": None},
     {"pdf": "pdf/UU Nomor 1 Tahun 2024.pdf", "uu_code": "UU_ITE_2024", "uu_name": "Undang-Undang Informasi dan Transaksi Elektronik (Perubahan 2024)", "uu_number": "UU No. 1 Tahun 2024", "year": 2024, "valid_from": None, "valid_to": None},
+    {"pdf": "pdf/UU Nomor 1 Tahun 1946.pdf", "uu_code": "KUHP_1946", "uu_name": "Kitab Undang-Undang Hukum Pidana Lama (KUHP)", "uu_number": "UU No. 1 Tahun 1946", "year": 1946, "valid_from": None, "valid_to": "2026-01-02"},
     {"pdf": "pdf/UU Nomor 6 Tahun 2023.pdf", "uu_code": "KUHP_2023", "uu_name": "Kitab Undang-Undang Hukum Pidana (KUHP)", "uu_number": "UU No. 6 Tahun 2023", "year": 2023, "valid_from": "2023-03-31", "valid_to": None},
     {"pdf": "pdf/UU Nomor 8 Tahun 1999.pdf", "uu_code": "UU_PERLINDUNGAN_KONSUMEN_1999", "uu_name": "Undang-Undang Perlindungan Konsumen", "uu_number": "UU No. 8 Tahun 1999", "year": 1999, "valid_from": None, "valid_to": None},
     {"pdf": "pdf/UU Nomor 16 Tahun 2019.pdf", "uu_code": "UU_PERKAWINAN_2019", "uu_name": "Undang-Undang Perkawinan", "uu_number": "UU No. 16 Tahun 2019", "year": 2019, "valid_from": None, "valid_to": None},
@@ -16,7 +34,7 @@ PDF_FILES = [
 
 OUTPUT_FILE = "final_corpus.jsonl"
 
-# ---------- PDF extraction (pypdf / pdfminer fallback) ----------
+# ---------------- [STEP 1] PDF extraction (pypdf, fallback pdfminer) ----------------
 def _extract_with_pypdf(pdf_path: str) -> str:
     from pypdf import PdfReader
     reader = PdfReader(pdf_path)
@@ -32,12 +50,12 @@ def _extract_with_pdfminer(pdf_path: str) -> str:
     return txt.replace("\r", "")
 
 def read_pdf_text(pdf_path: str) -> str:
-    # try pypdf, fallback to pdfminer if text seems too short or pypdf fails
+    # Attempt pypdf first, fallback to pdfminer if text too short or pypdf fails
     try:
         txt = _extract_with_pypdf(pdf_path)
     except Exception:
         txt = ""
-    if len(txt) < 500:  # heuristic threshold; adjust if needed
+    if len(txt) < 500:
         try:
             alt = _extract_with_pdfminer(pdf_path)
             if len(alt) > len(txt):
@@ -46,7 +64,7 @@ def read_pdf_text(pdf_path: str) -> str:
             pass
     return txt
 
-# ---------- Structure detection (Pasal / Buku / Bab / Bagian) ----------
+# ---------------- [STEP 2] Detect structure (BUKU/BAB/BAGIAN/PASAL) ----------------
 PASAL_ANY_RE = re.compile(r'(?im)^\s*Pasal\s+((\d+[A-Za-z]?)|([IVXLCM]+))\s*$', re.MULTILINE)
 BUKU_RE   = re.compile(r'(?im)^\s*BUKU\s+([IVXLC]+)\s*(.*)$')
 BAB_RE    = re.compile(r'(?im)^\s*BAB\s+([IVXLC]+)\s*(.*)$')
@@ -54,6 +72,7 @@ BAGIAN_RE = re.compile(r'(?im)^\s*Bagian\s+([0-9IVXLC]+)\s*(.*)$')
 
 def detect_structure(full_text: str) -> List[Dict]:
     lines = full_text.splitlines()
+    # map line index to absolute char offset (for nearest-tag lookup)
     line_starts = []
     pos = 0
     for ln in lines:
@@ -88,9 +107,7 @@ def detect_structure(full_text: str) -> List[Dict]:
         end = matches[i+1].start() if i+1 < len(matches) else len(full_text)
         pasal_label = m.group(1).strip()
         body = full_text[start:end].strip()
-        # remove "Pasal X" header line only
         body = re.sub(r'(?im)^\s*Pasal\s+' + re.escape(pasal_label) + r'\s*$', '', body).strip()
-        # tidy whitespace but preserve long separator lines and ayat markers
         body = re.sub(r'[ \t]+', ' ', body)
         out.append({
             "pasal_number": pasal_label,
@@ -101,24 +118,22 @@ def detect_structure(full_text: str) -> List[Dict]:
         })
     return out
 
-# ---------- Minimal cleaning (preserve separators and ayat markers) ----------
+# ---------------- [STEP 3] Minimal cleaning / normalization ----------------
 def minimal_clean(t: str) -> str:
     if t is None:
         return t
-    # remove null bytes, normalize Unicode, join hyphenation like "da-\nri" -> "dari"
     t = t.replace('\x00', '')
     t = unicodedata.normalize('NFKC', t)
-    t = re.sub(r'-\n\s*', '', t)
-    # trim trailing whitespace on each line
+    t = re.sub(r'-\n\s*', '', t)               # join hyphenation
+    t = re.sub(r'\s*\.\s*\.\s*\.\s*', '…', t) # ". . ." -> …
+    # preserve long separators and (1)/(2) markers — do not remove them
     lines = [ln.rstrip() for ln in t.splitlines()]
-    # collapse 4+ newlines into two, but keep 1-3 as-is (so separator lines remain)
     text = "\n".join(lines)
     text = re.sub(r'\n{4,}', '\n\n', text)
-    # replace multiple spaces/tabs with single space (but keep newlines)
     text = re.sub(r'[ \t]{2,}', ' ', text)
     return text.strip()
 
-# ---------- Build per-pasal record (no id, unit=pasal) ----------
+# ---------------- Build per-pasal records (STEP 4: mapping to structured records) ----------
 def build_records_per_pdf(cfg: Dict) -> List[Dict]:
     pdf_path = Path(cfg["pdf"])
     raw_text = read_pdf_text(pdf_path)
@@ -129,12 +144,10 @@ def build_records_per_pdf(cfg: Dict) -> List[Dict]:
     for blk in blocks:
         pasal = blk.get("pasal_number")
         body = blk.get("text", "")
-        # minimal cleaning only; do NOT split ayat -> keep (1)/(2) markers in text
         cleaned = minimal_clean(body)
         buku_obj = blk.get("buku")
         bab_obj = blk.get("bab")
         bagian_obj = blk.get("bagian")
-
         rec = {
             "uu_code": cfg.get("uu_code"),
             "uu_name": cfg.get("uu_name"),
@@ -143,7 +156,7 @@ def build_records_per_pdf(cfg: Dict) -> List[Dict]:
             "section_type": "PASAL",
             "title": f"Pasal {pasal}",
             "pasal_number": pasal,
-            "ayat_number": None,               # per-pasal output like your example
+            "ayat_number": None,   # keep per-pasal at this stage
             "buku": (buku_obj[1] if buku_obj else None),
             "bab": (bab_obj[1] if bab_obj else None),
             "bagian": (bagian_obj[1] if bagian_obj else None),
@@ -155,31 +168,101 @@ def build_records_per_pdf(cfg: Dict) -> List[Dict]:
         records.append(rec)
     return records
 
-# ---------- Write output ----------
-def write_jsonl(records: List[Dict], out_path: str):
-    with open(out_path, "a", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+# ---------------- [STEP 5] Explode Pasal -> Ayat (explode_ayat_rows) ----------------
+AYAT_SPLIT_RE = re.compile(r"\(\s*(\d+)\s*\)")
 
-# ---------- Main ----------
+def explode_ayat_rows_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Expect df to have columns including "text", "section_type", "ayat_number", and metadata
+    rows = []
+    for _, r in df.iterrows():
+        text = str(r.get("text", "") or "").strip()
+        sect = (r.get("section_type") or "").upper()
+        # only attempt explosion when row is PASAL and ayat_number is empty/null
+        if sect == "PASAL" and (pd.isna(r.get("ayat_number")) or str(r.get("ayat_number")) in ("", "nan")):
+            parts = AYAT_SPLIT_RE.split(text)
+            if len(parts) > 1:
+                # split result example: ['', '1', 'first ayat body', '2', 'second ayat body', ...]
+                for i in range(1, len(parts), 2):
+                    ay = str(parts[i]).strip()
+                    body = (parts[i+1] or "").strip()
+                    if not body:
+                        continue
+                    rr = r.copy()
+                    rr["section_type"] = "AYAT"
+                    rr["ayat_number"] = ay
+                    rr["text"] = body
+                    rows.append(rr)
+                continue
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+# ---------------- [STEP 6] Drop Penjelasan (filter out explanation blocks) ----------------
+def drop_penjelasan_df(df: pd.DataFrame) -> pd.DataFrame:
+    def is_penjelasan(row):
+        text = str(row.get("text","") or "").strip().lower()
+        title = str(row.get("title","") or "").lower()
+        if text.startswith("cukup jelas"):
+            return True
+        if "penjelasan" in title:
+            return True
+        return False
+    mask = df.apply(is_penjelasan, axis=1)
+    keep_df = df[~mask].reset_index(drop=True)
+    return keep_df
+
+# ---------------- [STEP 7] Final write JSONL (corpus assembly) ----------------
+def write_jsonl_from_df(df: pd.DataFrame, out_path: str):
+    with open(out_path, "a", encoding="utf-8") as fh:
+        for _, row in df.iterrows():
+            rec = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+# ---------------- MAIN flow ----------------
 def main():
     outp = Path(OUTPUT_FILE)
-    outp.write_text("", encoding="utf-8")  # clear
-    total = 0
+    # clear output
+    outp.write_text("", encoding="utf-8")
+    total_records = 0
+
+    all_records = []
     for cfg in PDF_FILES:
         p = Path(cfg["pdf"])
         if not p.exists():
-            print(f"❌ Missing file: {cfg['pdf']}  (skipping)")
+            print(f"Missing: {p}  (skipping)")
             continue
         try:
-            recs = build_records_per_pdf(cfg)
+            recs = build_records_per_pdf(cfg)  # STEP 1..3..4
         except Exception as e:
-            print(f"⚠️ Error processing {cfg['pdf']}: {e}")
+            print(f"Error processing {p}: {e}")
             continue
-        write_jsonl(recs, OUTPUT_FILE)
-        print(f"✅ {p.name} -> {len(recs)} records")
-        total += len(recs)
-    print(f"\nWROTE TOTAL: {total} records → {OUTPUT_FILE}")
+        all_records.extend(recs)
+        print(f" Extracted {len(recs)} pasal-records from {p.name}")
+
+    if not all_records:
+        print("No records extracted. Exiting.")
+        return
+
+    # convert to DataFrame for further steps
+    df = pd.DataFrame(all_records)
+
+    # STEP 5: explode pasal -> ayat rows (if (1),(2) markers exist)
+    df = explode_ayat_rows_df(df)
+    print(f"After explode_ayat_rows: {len(df)} rows")
+
+    # normalize pasal_number and ayat_number to string no trailing .0
+    if "pasal_number" in df.columns:
+        df["pasal_number"] = df["pasal_number"].astype(str).str.replace(r"\.0$","", regex=True)
+    if "ayat_number" in df.columns:
+        df["ayat_number"] = df["ayat_number"].astype(str).str.replace(r"\.0$","", regex=True)
+
+    # STEP 6: drop penjelasan blocks
+    df = drop_penjelasan_df(df)
+    print(f"After drop_penjelasan: {len(df)} rows remain")
+
+    # STEP 7: write final JSONL (merge corpus)
+    write_jsonl_from_df(df, outp)
+    total_records = len(df)
+    print(f"\n WROTE TOTAL: {total_records} records → {outp}")
 
 if __name__ == "__main__":
     main()
